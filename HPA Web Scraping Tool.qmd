@@ -1,0 +1,357 @@
+---
+title: "R HPA Web Scrape Tool"
+format: html
+editor: visual
+---
+
+# R HPA Web Scrape Tool
+
+This document is modelled off a python script from Bowie.
+
+# DOCUMENT SET-UP
+
+## LIBRARIES
+
+```{r setup}
+library(tidyverse)
+library(httr)
+library(rvest)
+library(here)
+library(chromote)
+library(lubridate)
+```
+
+# SECTION 1 - EXTRACTING LINKS
+
+## Master Links For Each Protein
+
+```{r}
+#Define the base URL to the page
+base_url <- "https://www.proteinatlas.org/search?page="
+
+#Empty storage vector before the loop to save on memory
+master_hyperlinks <- c()
+
+#Loop through first page -- change to 404 once confirmed works. 
+for (page_num in 0:404) {
+  page_url <- paste0(base_url, page_num)
+  page <- read_html(page_url)
+  
+  #Extract hyperlinks
+  page_links <- page |>
+    html_nodes(".atlascol a") |> 
+    html_attr("href") |> 
+    purrr::map_chr(~ paste("https://www.proteinatlas.org", ., sep=""))
+#^^Concatenate to make functional
+  
+  #Storage vector
+  tissue_links <- unique(page_links[grepl("/tissue$", page_links)])
+  
+  #Fixing capturing of duplicates
+  master_hyperlinks <- unique(c(master_hyperlinks, tissue_links))
+  
+#Print progress
+  cat("Page", page_num, "done\n")
+}
+
+#Check the total number of links - Should be 20162 genes
+length(master_hyperlinks)
+master_hyperlinks
+
+#Optional to export whole hyperlinks
+write.csv(master_hyperlinks, here::here("data", "HPA_master_links.csv"), row.names = FALSE)
+
+```
+
+## Parent Links For Each Tissue Type
+
+```{r}
+#Reframe above section to loop in each parent link for secondary links
+parent_links <- function(page_link) {
+  page <- read_html(page_link)
+  
+#CSS selector "div#menu_tissues".
+  secondary <- page |> 
+    html_nodes("div#menu_tissues a") |> 
+    html_attr("href") |> 
+    purrr::map_chr(~ paste("https://www.proteinatlas.org", ., sep=""))
+}
+
+all_tissue_links <- c() # <- #Empty vector for saving memory
+
+#Loop through each link and collect the tissue-specific links
+for (link in master_hyperlinks) {
+  tissue_links <- parent_links(link)
+  all_tissue_links <- c(all_tissue_links, tissue_links)
+  cat("Processed:", link, "\n")
+}
+
+#Optional Export the data to keep
+write.csv(all_tissue_links, here::here("data", "HPA_parent_tissue_links.csv"), row.names = FALSE)
+```
+
+# SECTION 2 - META SCRAPE
+
+## Defining the dataset
+
+```{r}
+#Define you're exact dataframe -> if running for all just run you're: 
+#convert to a datadframe
+all_tissue_links_df <- data.frame(links = all_tissue_links, stringsAsFactors = FALSE)
+
+#EXAMPLE - filter for 'cerebellum'
+cerebellum_links_df <- all_tissue_links |> 
+  filter(grepl("/cerebellum$", links))
+
+#make even smaller to run in chunks 
+testing_cerebellum_df_1 <- cerebellum_links_df |> 
+  arrange(links) |> 
+  slice(251:2000)
+
+```
+
+## Running The Meta Scrape
+
+```{r}
+chrome_session_HPA <- ChromoteSession$new() #Opening the chromote server
+#chrome_session_HPA$view() #<-optional to watch what's going on - good when working on code. 
+
+#Empty storage DF
+image_data_df <- data.frame(
+  URL = character(),
+  ImageURL = character(),
+  Metadata = character(),
+  stringsAsFactors = FALSE
+)
+
+#Total number of PARENT URLs
+total_urls <- nrow(testing_cerebellum_df_1) #Change based on how you've filered data
+
+#Loop through each of the defined dataset parent URLs
+for (index in 1:total_urls) {
+  url <- testing_cerebellum_df_1$links[index]
+  
+#Progress notifications for sanity 
+  cat(sprintf("Processing URL %d of %d: %s\n", index, total_urls, url))
+  
+  #Go to parent URL
+  chrome_session_HPA$Page$navigate(url)
+  Sys.sleep(0.5)
+  
+  #Count images on the page
+  result <- chrome_session_HPA$Runtime$evaluate(
+    "document.querySelectorAll('a.imid').length"
+  )
+  num_elements <- result$result$value
+
+  #Output how amny images in each URL 
+  cat(sprintf("Number of images found: %d\n", num_elements))
+  #If no images - skip 
+  if (num_elements == 0) {
+    cat("No image elements found for:", url, "\n")
+    next
+  }
+  
+#Secondary loop throught though each image - grab meta & href
+
+  for (i in seq_len(num_elements)) {
+    click_script <- sprintf("document.querySelectorAll('a.imid')[%d].click()", i - 1)
+    chrome_session_HPA$Runtime$evaluate(click_script)
+    Sys.sleep(0.5)
+
+    #Grab image URLs
+    image_href_result <- chrome_session_HPA$Runtime$evaluate(
+      sprintf("document.querySelectorAll('a.imid')[%d].href", i - 1)
+    )
+    image_href <- image_href_result$result$value
+
+   #Grab the meta
+    seadragon_text_result <- chrome_session_HPA$Runtime$evaluate("document.getElementById('seadragon_meta').innerText")
+    seadragon_text <- seadragon_text_result$result$value
+
+    #Store the parent URL, new image URL, and metadata into the df
+    image_data_df <- rbind(image_data_df, data.frame(
+      ParentURL = url,
+      ImageURL = image_href,
+      Metadata = seadragon_text,
+      stringsAsFactors = FALSE
+    ))
+    Sys.sleep(0.5)
+  }
+  
+  image_data_df_clean <- image_data_df |> 
+    distinct(Metadata, .keep_all = TRUE)
+  
+  write.csv(image_data_df_clean, here::here("output", "META_testing_PARENT_cerebellum_df_251-2000.csv"), row.names = FALSE)
+}
+```
+
+## Tidy Up The Data
+
+### Main Tidy
+
+```{r}
+#Function to duplicate the rows for each different Cell_Type and extract the staining information 
+expand_by_cell_type_with_staining <- function(df) {
+  df |> 
+    #Each different cell type is ALWAYS listed BEFORE a "Staining"
+    mutate(Cell_Type_Sections = str_extract_all(Metadata, "[^;]+;;Staining:.*?(?=(;;[^;]+;;Staining:|$))")) |> 
+    
+    unnest_longer(Cell_Type_Sections) |> #Expand it out
+    
+    #Grab the text up to ";;Staining"
+    mutate(
+      Cell_Type = str_extract(Cell_Type_Sections, "^[^;]+"),
+      Cell_Type = trimws(Cell_Type)
+    ) |> 
+    
+    #Create blank columns for SIQ
+    mutate(
+      Staining = NA_character_, 
+      Intensity = NA_character_,
+      Quantity = NA_character_  
+    )
+}
+#Function to grab the staining text 
+extract_staining <- function(Cell_Type, Metadata) {
+  Metadata <- str_replace_all(Metadata, "[\\t\\n\\r]", "") # take these out of the meta
+  pattern <- paste0(Cell_Type, ";;Staining:;;;;;;([^;]+)")  #search for this pattern
+  match <- str_extract(Metadata, pattern)
+  if (!is.na(match)) {
+    return(str_extract(match, "(?<=Staining:;;;;;;)([^;]+)"))
+  } else {
+    return(NA_character_)
+  }
+}
+
+#MAIN DATA RESTRUCTURE
+
+data_cleaned <- image_data_df_clean |> 
+  #Replace the newline characters within the metadata semicolons
+  mutate(Metadata = str_replace_all(Metadata, "\n", ";")) |> 
+  
+  #Mutate the meta into the columns by pulling info
+  mutate(
+    Patient_ID = str_extract(Metadata, "(?<=Patient id: )\\d+"),
+    Tissue = str_extract(Metadata, "^[A-Za-z]+"),
+    Antibody = str_extract(Metadata, "[A-Z]{3}\\d{6}|[A-Z]+\\d+"),
+    
+    #SPLIT sex and age out
+    Sex_Age = str_extract(Metadata, "Female, age \\d+|Male, age \\d+"),
+    Sex = str_extract(Sex_Age, "Female|Male"),
+    Age = str_extract(Sex_Age, "\\d+"),
+    
+    #Tissue location and status can have multiples -- combine into one string
+    Tissue_Location = str_extract_all(Metadata, "[A-Za-z\\s]+\\(T-[A-Za-z\\d]+\\)"),
+    Tissue_Location = sapply(Tissue_Location, function(x) paste(x, collapse = "; ")),
+    Tissue_Status = str_extract(Metadata, "(?<!T-)[^;]*(M-[A-Za-z\\d]+)[^;]*"),
+    Tissue_Status = sapply(Tissue_Status, function(x) paste(x, collapse = "; ")),
+    
+    #Grab protein from parent URL column
+    Protein = str_extract(ParentURL, "(?<=-)[^-]+(?=/tissue)")
+  ) |> 
+
+  expand_by_cell_type_with_staining() |> 
+  
+  # Extract Staining
+  mutate(
+    Staining = mapply(extract_staining, Cell_Type, Metadata)  # If extracting Quantity is needed
+  ) |> 
+  
+  select(ParentURL, ImageURL, Protein, Tissue, Antibody, Tissue_Location, Tissue_Status, Patient_ID, Sex, Age, Cell_Type, Staining, Intensity, Quantity, Metadata)
+```
+
+### Secondary Tidy to include Intensity & Quantity Values
+
+```{r}
+#Clean up of the meta column - getting rid of all unneeded characters/spaces etc... 
+data_cleaned$Metadata <- str_replace_all(data_cleaned$Metadata, "[\\t\\n\\r]", "")
+data_cleaned$Metadata <- str_replace_all(data_cleaned$Metadata, ";{2,}", ";")
+data_cleaned$Metadata <- str_replace_all(data_cleaned$Metadata, "\\s*:\\s*", "")
+data_cleaned$Metadata <- str_replace_all(data_cleaned$Metadata, "; ;", ";")
+data_cleaned$Metadata <- str_trim(data_cleaned$Metadata)
+
+#Function to grab the intensity associated with that exact already defined cell type from the Cell_Type column... 
+extract_intensity <- function(Cell_Type, Metadata) {
+  pattern <- paste0(Cell_Type, ";Staining;[^;]+;Intensity;([^;]+)")  #How it needs to assess the meta string 
+  match <- str_extract(Metadata, pattern)
+  if (!is.na(match)) {
+    return(str_extract(match, "(?<=Intensity;)([^;]+)"))
+  } else {
+    return(NA_character_)
+  }
+}
+
+#Function to extract quantity same way as intensity
+extract_quantity <- function(Cell_Type, Metadata) {
+  pattern <- paste0(Cell_Type, ";Staining;[^;]+;Intensity;[^;]+;Quantity;([^;]+)")
+  match <- str_extract(Metadata, pattern)
+  if (!is.na(match)) {
+    return(str_extract(match, "(?<=Quantity;)([^;]+)"))
+  } else {
+    return(NA_character_)
+  }
+}
+
+#Put the grabbed data from functions back into the DF 
+SIQdata <- data_cleaned |> 
+  mutate(
+    Intensity = mapply(extract_intensity, Cell_Type, Metadata),
+    Quantity = mapply(extract_quantity, Cell_Type, Metadata)
+  ) |> 
+  
+  select(ParentURL, ImageURL, Protein, Tissue, Antibody, Tissue_Location, Tissue_Status, Patient_ID, Sex, Age, Cell_Type, Staining, Intensity, Quantity)
+#ADD BACK IN 'Metadata' WHEN WANTING TO CROSS REFERENCE HOW THE DATA HAS PULLED.
+#Metadata
+
+write.csv(SIQdata, here::here("output", "META_testing_Tidy_cerebellum_df_251-2000.csv"), row.names = FALSE)
+
+```
+
+# SECTION 3 - DOWNLOAD THE IMAGES
+
+```{r}
+#Use the original master list collection of data from earlier so it only downloads one image per antibody and avoids getting caught in a loop from the cell type splits in the cleaned data. 
+image_data_df_clean
+count(image_data_df_clean, ImageURL)
+
+# REDEFINE 
+save_folder <- "path-to-your-export-folder"
+
+# Make sure the save folder exists
+if (!dir.exists(save_folder)) {
+  dir.create(save_folder, recursive = TRUE)  # Create the folder if it doesn't exist
+}
+
+#Capture any that don't download
+failed_downloads <- c()
+
+#Loop through the master dataframe 
+for (url in image_data_df_clean$ImageURL) {
+  safe_file_name <- sub("https://images.proteinatlas.org/", "", url) #Remove 'https://images.proteinatlas.org/' to create a unique filenames
+  safe_file_name <- gsub("/", "_", safe_file_name)  #replace / with -
+  
+  # Combine the save folder path with the safe file name
+  full_path <- file.path(save_folder, safe_file_name)
+
+  cat("Saving to:", full_path, "\n")
+  
+  #DOWNLOAD
+  tryCatch({
+    download.file(url, full_path, mode = "wb")
+    cat("Downloaded successfully!\n")
+  }, error = function(e) {
+    cat("Error downloading:", e$message, "\n")
+    failed_downloads <- c(failed_downloads, url)  #Add any failed URLs to the list
+  })
+}
+
+#Show any URLs that didn't download
+if (length(failed_downloads) > 0) {
+  cat("Failed to download the following URLs:\n")
+  print(failed_downloads)
+} else {
+  cat("All images downloaded successfully!\n")
+}
+```
+
